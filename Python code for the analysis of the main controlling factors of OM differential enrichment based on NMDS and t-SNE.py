@@ -190,7 +190,7 @@ pca_silhouette = silhouette_score(data_scaled, cluster_labels)
 pca_calinski_harabasz = calinski_harabasz_score(data_scaled, cluster_labels)
 pca_davies_bouldin = davies_bouldin_score(data_scaled, cluster_labels)
 
-# Print the scoring metrics.
+# Print the scoring metrics for PCA.
 print(f"PCA Silhouette Score: {pca_silhouette}")
 print(f"PCA Calinski-Harabasz Score: {pca_calinski_harabasz}")
 print(f"PCA Davies-Bouldin Score: {pca_davies_bouldin}")
@@ -215,7 +215,7 @@ def compute_distance_value(data, regions, metric='euclidean'):
 valid_params = list(best_parameters)
 valid_data = normalized_data[valid_params]
 best_tsne_params, tsne_result, best_scores, best_score = optimize_tsne(valid_data, regions)
-# 打印最佳评分指标
+# Print the scoring metrics for t-sne
 tsne_silhouette, tsne_calinski_harabasz, tsne_davies_bouldin = best_scores
 print(f"t-SNE Silhouette Score: {tsne_silhouette}")
 print(f"t-SNE Calinski-Harabasz Score: {tsne_calinski_harabasz}")

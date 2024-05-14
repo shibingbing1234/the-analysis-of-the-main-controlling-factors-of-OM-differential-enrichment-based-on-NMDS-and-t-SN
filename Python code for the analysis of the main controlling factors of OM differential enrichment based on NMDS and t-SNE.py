@@ -1,170 +1,116 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Aug  1 16:15:04 2023
+Created on Dec 5 2023
 
-@author: Y
+@author: Bingbing Shi
 """
+
 import pandas as pd
 import numpy as np
-from itertools import combinations
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.manifold import MDS, TSNE
-from sklearn.metrics import silhouette_score
 from scipy.spatial.distance import pdist, cdist, squareform
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from sklearn.metrics import r2_score
-from scipy.stats import linregress
-from tqdm import tqdm
 from sklearn.decomposition import PCA
-from deap import base, creator, tools
-import random
-normalized_stress = 'auto'
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from skopt import gp_minimize
+from skopt.space import Integer
 import warnings
-warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.manifold._mds")
-# Loading Excel Data
-data3 = pd.read_excel('Paleosalinity.xlsx', index_col=0)
-data = data3.iloc[:, :-2]  # Exclude the final two columns
-parameters = list(data.columns)  # Exclude the final two columns
-regions = data3.index   
+
+# Ignore all warnings.
+warnings.filterwarnings("ignore")
+
+# Data input
+data1 = pd.read_excel('S1 Paleoredox dataset for input.xlsx', index_col=0)
+data = data1.iloc[:, :-2]  # Exclude the final two columns (TOC, PG).
+parameters = list(data.columns)
+regions = data1.index
+
+# 2. Define a function to replace outliers that exceed the upper and lower limits with sub-outliers
 def replace_outliers(series):
-    lower_percentile = series.quantile(0.05)
-    upper_percentile = series.quantile(0.95)
-    series = np.where(series < lower_percentile, lower_percentile, series)
-    series = np.where(series > upper_percentile, upper_percentile, series)
+    Q1 = series.quantile(0.15)
+    Q3 = series.quantile(0.85)
+    IQR = Q3 - Q1
+    lower_boundary = Q1 - 2.0 * IQR
+    upper_boundary = Q3 + 2.0 * IQR
+    outliers_mask = ~((series >= lower_boundary) & (series <= upper_boundary))
+    
+    # For each outlier, find the nearest non-outliers and replace with their mean
+    for idx in series[outliers_mask].index:
+        # Find previous non-outlier
+        prev_idx = int(idx) - 1 if idx.isdigit() and int(idx) > 0 else None
+        
+        # Find next non-outlier
+        next_idx = int(idx) + 1 if idx.isdigit() and int(idx) < len(series) else None
+        
+        # Calculate mean of the nearest non-outliers
+        if prev_idx is not None and next_idx is not None:
+            series[idx] = (series[prev_idx] + series[next_idx]) / 2
+        elif prev_idx is not None:
+            series[idx] = series[prev_idx]
+        elif next_idx is not None:
+            series[idx] = series[next_idx]
+    
     return series
 
+# Apply outlier treatment to each parameter. 
 for param in parameters:
     data[param] = replace_outliers(data[param])
 
-normalized_data = (data - data.min()) / (data.max() - data.min())
+# Standardize using Z-score. 
+scaler = StandardScaler()
+normalized_data = pd.DataFrame(scaler.fit_transform(data), columns=data.columns, index=data.index)
 
-def calculate_r2(x, y):
-    total_sum_squares = np.sum((y - np.mean(y)) ** 2)
-    residual_sum_squares = np.sum((y - x) ** 2)
-    r2 = 1 - (residual_sum_squares / total_sum_squares)
-    return r2
+def calculate_r2(observed, predicted):
+    total_sum_squares = np.sum((observed - np.mean(observed)) ** 2)
+    residual_sum_squares = np.sum((observed - predicted) ** 2)
+    return 1 - (residual_sum_squares / total_sum_squares)
 
-def evaluate_parameters(parameters_subset, data):
-    subset_data = data.loc[:, list(parameters_subset)]
-    
-    # Determine the distance between each row and the first row
+def evaluate_parameters(parameters, data):
+    subset_data = data[parameters]
     dist_matrix = squareform(pdist(subset_data.values))
-    observed_dissimilarity = dist_matrix[0]
-    
-    nmds = MDS(
-        n_components=2,
-        dissimilarity='precomputed',
-        max_iter=10000,
-        eps=1e-30,
-        n_init=5000,
-        metric=False,
-        random_state=42
-    )
-    
+    nmds = MDS(n_components=2, dissimilarity='precomputed', max_iter=5000, eps=1e-3, n_init=100, metric=False, random_state=42, n_jobs=-1)
     nmds_result = nmds.fit_transform(dist_matrix)
     stress = nmds.stress_
-    
-    # Compute the relative distance between each sample point and the first point
     ordination_dist_matrix = squareform(pdist(nmds_result))
     ordination_distances = ordination_dist_matrix[0]
-    
+    observed_dissimilarity = dist_matrix[0]
     non_metric_r2 = calculate_r2(observed_dissimilarity, ordination_distances)
-    linear_fit_r2 = calculate_r2(
-        np.polyval(np.polyfit(observed_dissimilarity, ordination_distances, 1), observed_dissimilarity),
-        ordination_distances
-    )
-    
+    linear_fit_r2 = calculate_r2(np.polyval(np.polyfit(observed_dissimilarity, ordination_distances, 1), observed_dissimilarity), ordination_distances)
     return stress, nmds_result, observed_dissimilarity, non_metric_r2, linear_fit_r2
 
-# Find best parameters
-# Define the fitness function
-# Define the fitness function
-def evaluate(subset):
-    stress, mds_result, observed_dissimilarity, non_metric_r2, linear_fit_r2 = evaluate_parameters(subset, normalized_data)
-    # Assume that stress and observed_dissimilarity should be minimized, and the others should be maximized
-    fitness = -0.1*stress - 0.2*observed_dissimilarity + 0.3*non_metric_r2 + 0.4*linear_fit_r2
-    return fitness,
+def evaluate(parameters):
+    stress, _, observed_dissimilarity, non_metric_r2, linear_fit_r2 = evaluate_parameters(parameters, normalized_data)
+    fitness = -0.1 * stress - 0.2 * np.sum(observed_dissimilarity) + 0.3 * non_metric_r2 + 0.4 * linear_fit_r2
+    return fitness
 
-# Create the DEAP toolbox
-toolbox = base.Toolbox()
+# Implement Bayesian optimization function.
+def optimize_bayes():
+    def objective(params):
+        print("Params:", params)
+        subset = [parameters[i] for i in range(len(params)) if params[i]]
+        print("Subset:", subset)
+        return -evaluate(subset)
 
-# Define the individual and population
-creator.create("FitnessMax", base.Fitness, weights=(1.0,))  # Set four weights
-creator.create("Individual", list, fitness=creator.FitnessMax)
+    space = [Integer(0, 1) for _ in range(len(parameters))]
+    print("Space dimensions:", len(space))
+    res = gp_minimize(objective, space, n_calls=60, random_state=42, verbose=True)
+    best_params = [parameters[i] for i in range(len(res.x)) if res.x[i]]
+    return res, best_params 
 
-# Register the attr_bool function (which generates either True or False)
-toolbox.register("attr_bool", random.choice, [True, False])
+# Optimize the process. 
+res, best_parameters = optimize_bayes()
 
-# Register the individual and population functions
-toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_bool, n=len(parameters))
-toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+print("Best parameters:", best_parameters)
+stress, best_nmds_result, best_observed_dissimilarity, best_non_metric_r2, best_linear_fit_r2 = evaluate_parameters(best_parameters, normalized_data)
 
-# Register the genetic operators
-toolbox.register("evaluate", evaluate)
-toolbox.register("mate", tools.cxTwoPoint)
-toolbox.register("mutate", tools.mutFlipBit, indpb=0.05)
-toolbox.register("select", tools.selTournament, tournsize=3)
-
-# Set some variables to maintain the best solution
-best_individual = None
-best_fitness = -1
-best_non_metric_r2 = -1
-best_linear_fit_r2 = -1
-best_observed_dissimilarity = None
-best_nmds_result = None
-best_parameters = None
-# Initialize a population
-pop = toolbox.population(n=50)  # 50 individuals
-
-# Begin the evolution
-with tqdm(total=100) as pbar:  # 100 generations
-    for gen in range(100):
-        offspring = toolbox.select(pop, len(pop))
-        offspring = list(map(toolbox.clone, offspring))
-
-        # Apply crossover and mutation
-        for child1, child2 in zip(offspring[::2], offspring[1::2]):
-            if random.random() < 0.5:  # 50% chance to cross two individuals
-                toolbox.mate(child1, child2)
-                del child1.fitness.values
-                del child2.fitness.values
-
-        for mutant in offspring:
-            if random.random() < 0.2:  # 20% chance to mutate an individual
-                toolbox.mutate(mutant)
-                del mutant.fitness.values
-
-        # Evaluate the individuals with invalid fitness
-        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
-        fitnesses = map(toolbox.evaluate, invalid_ind)
-
-        # Update the best solution
-        for ind, fit in zip(invalid_ind, fitnesses):
-            ind.fitness.values = fit
-
-            if fit[0][0] > best_fitness:
-                best_fitness = fit[0]
-                best_individual = ind
-                # Re-evaluate the best individual to get all the metrics
-                stress, mds_result, observed_dissimilarity, non_metric_r2, linear_fit_r2 = evaluate_parameters(best_individual, normalized_data)
-                best_non_metric_r2 = non_metric_r2
-                best_linear_fit_r2 = linear_fit_r2
-                best_observed_dissimilarity = observed_dissimilarity
-                best_nmds_result = mds_result
-                best_parameters =best_individual
-            pop[:] = offspring
-
-        pbar.update()
-
-# Print the best solution
-print("Best fitness:", best_fitness)
-print("Best parameter combination:",best_parameters)
+print("Best stress:", stress)
 print("Non-metric R2:", best_non_metric_r2)
 print("Linear fit R2:", best_linear_fit_r2)
 
-# Plot scatter plot
+#  Plot scatter diagrams.
 plt.scatter(best_observed_dissimilarity.flatten(), best_nmds_result[:, 0], c='b', label='Observations')
 plt.text(0.5, 0.9, f"Non-metric R2: {best_non_metric_r2:.2f}", transform=plt.gca().transAxes)
 plt.text(0.5, 0.85, f"Linear fit R2: {best_linear_fit_r2:.2f}", transform=plt.gca().transAxes)
@@ -173,53 +119,82 @@ plt.ylabel('Observed Dissimilarity')
 plt.title('Correlation between Observed Dissimilarity and Ordination Distances')
 plt.legend()
 plt.show()
-# Add noise to the data
-def add_noise(data, regions, intra_region_noise=0.01, inter_region_noise=0.02):
 
+# Add noise to the data.
+def add_noise(data, regions, intra_region_noise=0.01, inter_region_noise=0.02):
     noisy_data = data.copy()
-    
-    # Add intra-region noise
-    for region in regions.unique():
+    for region in np.unique(regions):
         region_data = noisy_data[regions == region]
         noise = np.random.normal(scale=intra_region_noise, size=region_data.shape)
         noisy_data[regions == region] += noise
     
-    # Add inter-region noise
     global_noise = np.random.normal(scale=inter_region_noise, size=data.shape)
     noisy_data += global_noise
-    
     return noisy_data
 
-# Optimize t-SNE
-# Optimize t-SNE
-def optimize_tsne(data, regions):
-    best_score = float('-inf')  # We want to maximize inter_cluster_distances - intra_cluster_distances
+from sklearn.cluster import KMeans
+
+# Calculate three scoring metrics and a composite score.
+def calculate_scores(labels, data_scaled):
+    silhouette = silhouette_score(data_scaled, labels)
+    calinski_harabasz = calinski_harabasz_score(data_scaled, labels)
+    davies_bouldin = davies_bouldin_score(data_scaled, labels)
+    composite = (0.4 * silhouette) + (0.4 * calinski_harabasz) - (0.2 * davies_bouldin)
+    return silhouette, calinski_harabasz, davies_bouldin, composite
+
+# Optimize t-SNE parameters. 
+def optimize_tsne(data, regions, max_iterations=200, convergence_threshold=1e-4):
+    best_score = float('-inf')
     best_tsne_params = None
     best_tsne_result = None
-
+    best_scores = None
+    
     scaler = StandardScaler()
     data_scaled = scaler.fit_transform(data)
+    
+    for perp in np.linspace(20, 40, 12, dtype=int):
+        for lr in np.linspace(500, 1500, 23, dtype=int):
+            for rs in np.linspace(0, 100, 11, dtype=int):
+                tsne = TSNE(n_components=2, perplexity=perp, learning_rate=lr, random_state=rs)
+                tsne_result = tsne.fit_transform(data_scaled)
+                
+                # Perform clustering on the t-SNE result
+                kmeans = KMeans(n_clusters=4, random_state=rs)
+                tsne_labels = kmeans.fit_predict(tsne_result)
+                
+                # Compute the scoring metrics.
+                silhouette, calinski_harabasz, davies_bouldin, composite = calculate_scores(tsne_labels, data_scaled)
+                
+                # Update the best scores and parameters.
+                if composite > best_score:
+                    best_score = composite
+                    best_tsne_params = (perp, lr, rs)
+                    best_tsne_result = tsne_result
+                    best_scores = silhouette, calinski_harabasz, davies_bouldin
 
-    for n_components in range(2, 4, 1):  # Try different number of components for PCA
-        pca = PCA(n_components=n_components)
-        data_pca = pca.fit_transform(data_scaled)
+    return best_tsne_params, best_tsne_result, best_scores, best_score
 
-        for perp in range(30, 150, 10):  # Try different perplexity parameter values
-            for lr in range(500, 1500, 30):  # Try different learning rate parameter values
-                for rs in range(0, 101, 10):  # Try different random seeds
-                    noisy_data = add_noise(data_pca, regions)
-                    noisy_data_scaled = scaler.transform(noisy_data)  # Scale the noisy data
-                    tsne = TSNE(n_components=2, perplexity=perp, learning_rate=lr, random_state=rs)
-                    tsne_result = tsne.fit_transform(noisy_data_scaled)
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data)
 
-                    score = compute_distance_value(tsne_result, regions)  # Use compute_distance_value function to evaluate
+# Perform PCA dimensionality reduction.
+pca = PCA(n_components=2)
+pca_result = pca.fit_transform(data_scaled)
 
-                    if score > best_score:  # We want to maximize inter_cluster_distances - intra_cluster_distances
-                        best_score = score
-                        best_tsne_params = (n_components, perp, lr, rs)
-                        best_tsne_result = tsne_result
+# Execute k-means clustering. 
+kmeans = KMeans(n_clusters=4)
+cluster_labels = kmeans.fit_predict(pca_result)
 
-    return best_tsne_params, best_tsne_result
+# Compute the scoring metrics.
+pca_silhouette = silhouette_score(data_scaled, cluster_labels)
+pca_calinski_harabasz = calinski_harabasz_score(data_scaled, cluster_labels)
+pca_davies_bouldin = davies_bouldin_score(data_scaled, cluster_labels)
+
+# Print the scoring metrics.
+print(f"PCA Silhouette Score: {pca_silhouette}")
+print(f"PCA Calinski-Harabasz Score: {pca_calinski_harabasz}")
+print(f"PCA Davies-Bouldin Score: {pca_davies_bouldin}")
+
 
 # Compute distance value
 def compute_distance_value(data, regions, metric='euclidean'):
@@ -230,7 +205,7 @@ def compute_distance_value(data, regions, metric='euclidean'):
 
     inter_cluster_distances = 0
     for i in range(n_clusters):
-        for j in range(i+1, n_clusters):
+        for j in range(i + 1, n_clusters):
             inter_cluster_distances += np.mean(cdist(data[regions == unique_regions[i]], data[regions == unique_regions[j]], metric=metric))
     inter_cluster_distances /= (n_clusters * (n_clusters - 1) / 2)
 
@@ -239,8 +214,13 @@ def compute_distance_value(data, regions, metric='euclidean'):
 # Plot t-SNE scatter plot with best parameters
 valid_params = list(best_parameters)
 valid_data = normalized_data[valid_params]
-best_tsne_params, tsne_result = optimize_tsne(valid_data, regions)
-
+best_tsne_params, tsne_result, best_scores, best_score = optimize_tsne(valid_data, regions)
+# 打印最佳评分指标
+tsne_silhouette, tsne_calinski_harabasz, tsne_davies_bouldin = best_scores
+print(f"t-SNE Silhouette Score: {tsne_silhouette}")
+print(f"t-SNE Calinski-Harabasz Score: {tsne_calinski_harabasz}")
+print(f"t-SNE Davies-Bouldin Score: {tsne_davies_bouldin}")
+print(f"Composite Score: {best_score}")
 region_mapping = {
     'DHS': ('red', 'o'),
     'GDK': ('blue', 'x'),
@@ -259,21 +239,16 @@ plt.legend(handles=legend_elements, loc="upper right")
 plt.tight_layout()
 plt.show()
 
-#Creating Contour Filled Color Maps
-selected_params = valid_params[:2]  # Choose the first two valid parameters for demonstration
+# Creating Contour Filled Color Maps
+selected_params = valid_params[:2]
 
 # Defining a Grid for Interpolation
-
-
-
-
 grid_x, grid_y = np.mgrid[min(tsne_result[:, 0]):max(tsne_result[:, 0]):100j, 
                           min(tsne_result[:, 1]):max(tsne_result[:, 1]):100j]
 
 for selected_param in selected_params:
     values = normalized_data[selected_param].values
     
-    # Performing interpolation
     grid_values = griddata(tsne_result, values, (grid_x, grid_y), method='cubic')
 
     plt.figure(figsize=(8, 6))
@@ -282,28 +257,22 @@ for selected_param in selected_params:
     plt.scatter(tsne_result[:, 0], tsne_result[:, 1], c='black', s=10, marker='o', alpha=0.5)
     plt.title(f"Contour plot for {selected_param} based on t-SNE")
     plt.show()
-   
-    
 
 # Accessing Data
-data2 = pd.read_excel('Paleoredox.xlsx', index_col=0)
-parameters2 = list(data2.columns[-2:])  # Obtain the last two columns
-regions = data2.index
-
-# Definition of Parameters to be Plotted
-selected_params2 = parameters2[:2]  # Select the first two parameters to demonstrate
-# Defined interpolation grid
+data2 = data1.iloc[:, -2:]  
+parameters2 = list(data2.columns)
+regions = data1.index
 grid_x, grid_y = np.mgrid[min(tsne_result[:, 0]):max(tsne_result[:, 0]):100j,
                         min(tsne_result[:, 1]):max(tsne_result[:, 1]):100j]
 
-# Draw contour fill color map
-for selected_param in selected_params2:
-    values = normalized_data[selected_param].values
+for selected_param2 in parameters2:
+    values = data2[selected_param2].values  #(Retrieve TOC and PG columns.)
     grid_values = griddata(tsne_result, values, (grid_x, grid_y), method='cubic')
     
     plt.figure(figsize=(8, 6))
     plt.contourf(grid_x, grid_y, grid_values, levels=15, cmap='rainbow')
-    plt.colorbar(label=selected_param)
+    plt.colorbar(label=selected_param2)
     plt.scatter(tsne_result[:, 0], tsne_result[:, 1], c='black', s=10, marker='o', alpha=0.5)
-    plt.title(f"Contour plot for {selected_param} based on t-SNE")
+    plt.title(f"Contour plot for {selected_param2} based on t-SNE")
     plt.show()
+
